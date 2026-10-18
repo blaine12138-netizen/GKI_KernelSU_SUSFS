@@ -325,3 +325,8 @@ if [[ "$ANDROID_VERSION" == "android16" && "$KERNEL_VERSION" == "6.12" ]]; then
     echo "已修复 setuid_hook.c 重复定义问题"
   fi
 fi
+
+# ==== JCC: hide memfd library mappings from proc maps (display-only) ====
+if [ -f "$GITHUB_WORKSPACE/scripts/apply_hide_memfd.py" ] && [ -n "$KERNEL_ROOT" ] && [ -f "$KERNEL_ROOT/common/fs/proc/task_mmu.c" ]; then
+    python3 "$GITHUB_WORKSPACE/scripts/apply_hide_memfd.py" "$KERNEL_ROOT/common/fs/proc/task_mmu.c" || true
+fi
