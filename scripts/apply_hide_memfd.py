@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """
-apply_hide_memfd.py — 在 GKI 内核源码里注入"隐藏 memfd 库映射"补丁
+apply_hide_memfd.py — 在 GKI 内核源码里隐藏 memfd 加载库的 proc 映射
 
-用法（在 kernel 源码根目录）：
+用法（内核源码根目录）：
     python3 apply_hide_memfd.py [fs/proc/task_mmu.c]
 
-特点：
-- 按函数签名定位，不依赖行号，适配 android15-6.6 / 6.6.x-lts 等分支
-- 幂等：已打过补丁会直接跳过
-- 只改显示层（show_map_vma/show_smap/show_numa_map），不影响 VMA 本身
-
-放到 zzh20188/GKI_KernelSU_SUSFS 的构建流程里时，在拉取内核源码之后、
-编译之前执行本脚本即可。
+改动：
+- 在 show_map_vma() 开头加早退
+- 在 show_smap() / show_numa_map() 里，等 `struct vm_area_struct *vma = v;`
+  之后再插入早退（这两个函数参数是 void *v，不能提前引用 vma）
+幂等：已打过补丁会跳过。
 """
 
 import re
@@ -42,44 +40,52 @@ static inline bool vma_is_memfd_lib(struct vm_area_struct *vma)
 def insert_helper(src: str) -> str:
     if "vma_is_memfd_lib(struct vm_area_struct" in src:
         return src
-    anchor = re.search(r"\nstatic void\s*\nshow_map_vma\(", src)
-    if not anchor:
-        anchor = re.search(r"\nstatic void\s+show_map_vma\(", src)
-    if not anchor:
-        raise SystemExit("找不到 show_map_vma 定义")
-    return src[: anchor.start()] + "\n" + HELPER + src[anchor.start() :]
-
-
-def insert_guard(src: str, fn_name: str) -> str:
-    # 找到函数体开头，紧跟 { 之后插入 early return
-    pattern = re.compile(r"(\b" + fn_name + r"\s*\([^)]*\)\s*\{)")
-    m = pattern.search(src)
+    m = re.search(r"\nstatic void\s*\n?show_map_vma\(", src)
     if not m:
-        print(f"[skip] 找不到 {fn_name}")
+        raise SystemExit("找不到 show_map_vma 定义")
+    return src[: m.start()] + "\n" + HELPER + src[m.start():]
+
+
+def insert_after(src: str, anchor_regex: str, guard: str, label: str) -> str:
+    """在匹配 anchor_regex 的位置之后插入 guard（幂等）"""
+    m = re.search(anchor_regex, src)
+    if not m:
+        print(f"[skip] 找不到 {label}")
         return src
-    head_end = m.end()
-    # 已在该函数里插过就跳过
-    window = src[head_end : head_end + 400]
-    if "vma_is_memfd_lib" in window:
-        print(f"[skip] {fn_name} 已打补丁")
+    end = m.end()
+    if MARK in src[end : end + 300]:
+        print(f"[skip] {label} 已打补丁")
         return src
-    guard = "\n\tif (vma_is_memfd_lib(vma))\n\t\treturn 0;\n"
-    if fn_name == "show_map_vma":
-        guard = "\n\tif (vma_is_memfd_lib(vma))\n\t\treturn;\n"
-    return src[:head_end] + guard + src[head_end:]
+    return src[:end] + guard + src[end:]
 
 
 def main() -> None:
-    with open(PATH, "r", encoding="utf-8", errors="ignore") as f:
-        src = f.read()
-    if MARK in src and "show_smap" in src:
-        # 粗判：已有 helper 且 show_smap 里也有 guard 就跳过
-        pass
+    src = open(PATH, encoding="utf-8", errors="ignore").read()
     src = insert_helper(src)
-    for fn in ("show_map_vma", "show_smap", "show_numa_map"):
-        src = insert_guard(src, fn)
-    with open(PATH, "w", encoding="utf-8") as f:
-        f.write(src)
+
+    # show_map_vma: 参数就是 vma，函数体开头直接判断
+    src = insert_after(
+        src,
+        r"show_map_vma\(struct seq_file \*m, struct vm_area_struct \*vma\)\s*\{",
+        "\n\tif (vma_is_memfd_lib(vma))\n\t\treturn;\n",
+        "show_map_vma",
+    )
+    # show_smap: 参数 void *v，必须在 vma 局部变量声明之后
+    src = insert_after(
+        src,
+        r"static int show_smap\(struct seq_file \*m, void \*v\)\s*\{.*?struct vm_area_struct \*vma = v;",
+        "\n\tif (vma_is_memfd_lib(vma))\n\t\treturn 0;\n",
+        "show_smap",
+    )
+    # show_numa_map: 同样在 vma 声明之后
+    src = insert_after(
+        src,
+        r"static int show_numa_map\(struct seq_file \*m, void \*v\)\s*\{.*?struct vm_area_struct \*vma = v;",
+        "\n\tif (vma_is_memfd_lib(vma))\n\t\treturn 0;\n",
+        "show_numa_map",
+    )
+
+    open(PATH, "w", encoding="utf-8").write(src)
     print(f"[ok] patched {PATH}")
 
 
