@@ -410,3 +410,177 @@ ACEEOF
 printf '\nobj-y += ace_obs.o\n' >> "$ACEDIR/kernel/Makefile"
 echo "ace_obs: injected into $ACEDIR"
 fi
+
+# ===== kcheat: 内核侧内存读写驱动 =====
+if [ "${KCHEAT:-1}" = "1" ] && [ -d "${KERNEL_ROOT:-.}/common/kernel" ] && ! grep -q 'kcheat.o' "${KERNEL_ROOT:-.}/common/kernel/Makefile" 2>/dev/null; then
+KDIR="${KERNEL_ROOT:-.}/common"
+cat > "$KDIR/kernel/kcheat.c" <<'KCHEATEOF'
+// kcheat: 内核侧外挂基础驱动（GKI 内核内建）
+// 提供 /proc/kcheat：
+//   echo "p <pid>"        > /proc/kcheat   设定目标进程
+//   echo "r <addr> <len>" > /proc/kcheat   读目标内存
+//   echo "w <addr> <hex>" > /proc/kcheat   写目标内存
+//   cat /proc/kcheat                       取最近一次读的 hex 结果
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/proc_fs.h>
+#include <linux/uaccess.h>
+#include <linux/sched.h>
+#include <linux/sched/task.h>
+#include <linux/mm.h>
+#include <linux/string.h>
+#include <linux/init.h>
+
+static struct proc_dir_entry *kcheat_entry;
+static struct task_struct *kcheat_target;
+static char kcheat_out[8192];
+static int kcheat_outlen;
+
+static long kcheat_parse_ul(const char **ps, int base)
+{
+	long v = 0;
+	const char *s = *ps;
+
+	while (*s == ' ')
+		s++;
+	if (base == 16 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))
+		s += 2;
+	while (*s) {
+		int d;
+		if (*s >= '0' && *s <= '9')
+			d = *s - '0';
+		else if (base == 16 && *s >= 'a' && *s <= 'f')
+			d = *s - 'a' + 10;
+		else if (base == 16 && *s >= 'A' && *s <= 'F')
+			d = *s - 'A' + 10;
+		else
+			break;
+		v = v * base + d;
+		s++;
+	}
+	*ps = s;
+	return v;
+}
+
+static void kcheat_hex(const unsigned char *b, int n)
+{
+	static const char hx[] = "0123456789abcdef";
+	int i;
+
+	kcheat_outlen = 0;
+	for (i = 0; i < n && kcheat_outlen < (int)sizeof(kcheat_out) - 2; i++) {
+		kcheat_out[kcheat_outlen++] = hx[(b[i] >> 4) & 0xf];
+		kcheat_out[kcheat_outlen++] = hx[b[i] & 0xf];
+	}
+	kcheat_out[kcheat_outlen++] = '\n';
+	kcheat_out[kcheat_outlen] = 0;
+}
+
+static ssize_t kcheat_write(struct file *file, const char __user *ubuf,
+			    size_t len, loff_t *off)
+{
+	char cmd[512];
+	int n = (int)min(len, sizeof(cmd) - 1);
+	const char *p = cmd;
+
+	if (copy_from_user(cmd, ubuf, n))
+		return -EFAULT;
+	cmd[n] = 0;
+	while (*p == ' ') p++;
+
+	if (p[0] == 'p') {
+		p++;
+		if (!kcheat_target) {
+			pid_t pid = (pid_t)kcheat_parse_ul(&p, 10);
+			kcheat_target = find_get_task_by_vpid(pid);
+			if (kcheat_target)
+				pr_info("kcheat: target pid=%d task=%px\n", pid, kcheat_target);
+			else
+				pr_info("kcheat: pid %d not found\n", pid);
+		}
+		return len;
+	}
+
+	if (p[0] == 'r') {
+		unsigned long addr, l;
+		unsigned char buf[2048];
+		int got;
+
+		p++;
+		addr = kcheat_parse_ul(&p, 16);
+		l = kcheat_parse_ul(&p, 10);
+		if (l == 0 || l > sizeof(buf))
+			l = 64;
+		if (!kcheat_target)
+			return -ENOENT;
+		got = access_process_vm(kcheat_target, addr, buf, (int)l, 0);
+		if (got < 0)
+			return got;
+		kcheat_hex(buf, got);
+		return len;
+	}
+
+	if (p[0] == 'w') {
+		unsigned long addr;
+		unsigned char buf[256];
+		int k = 0, hi = -1;
+
+		p++;
+		addr = kcheat_parse_ul(&p, 16);
+		while (*p && k < (int)sizeof(buf)) {
+			int d;
+			char c = *p++;
+			if (c >= '0' && c <= '9') d = c - '0';
+			else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+			else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+			else continue;
+			if (hi < 0) hi = d;
+			else { buf[k++] = (unsigned char)((hi << 4) | d); hi = -1; }
+		}
+		if (!kcheat_target || k == 0)
+			return len;
+		access_process_vm(kcheat_target, addr, buf, k, FOLL_WRITE);
+		return len;
+	}
+
+	return -EINVAL;
+}
+
+static ssize_t kcheat_read(struct file *file, char __user *ubuf,
+			   size_t len, loff_t *off)
+{
+	if (*off >= kcheat_outlen)
+		return 0;
+	if (copy_to_user(ubuf, kcheat_out + *off, kcheat_outlen - *off))
+		return -EFAULT;
+	*off = kcheat_outlen;
+	return 0;
+}
+
+static const struct proc_ops kcheat_ops = {
+	.proc_write = kcheat_write,
+	.proc_read = kcheat_read,
+};
+
+static int __init kcheat_init(void)
+{
+	kcheat_entry = proc_create("kcheat", 0666, NULL, &kcheat_ops);
+	pr_info("kcheat: init entry=%px\n", kcheat_entry);
+	return 0;
+}
+
+static void __exit kcheat_exit(void)
+{
+	if (kcheat_entry)
+		proc_remove(kcheat_entry);
+	pr_info("kcheat: exit\n");
+}
+
+module_init(kcheat_init);
+module_exit(kcheat_exit);
+MODULE_LICENSE("GPL");
+
+KCHEATEOF
+printf '\nobj-y += kcheat.o\n' >> "$KDIR/kernel/Makefile"
+echo "kcheat: injected into $KDIR"
+fi
