@@ -330,3 +330,73 @@ fi
 if [ -f "$GITHUB_WORKSPACE/scripts/apply_hide_memfd.py" ] && [ -n "$KERNEL_ROOT" ] && [ -f "$KERNEL_ROOT/common/fs/proc/task_mmu.c" ]; then
     python3 "$GITHUB_WORKSPACE/scripts/apply_hide_memfd.py" "$KERNEL_ROOT/common/fs/proc/task_mmu.c" || true
 fi
+# ===== ACE 线程阻断（自定义补丁）=====
+if [ -d ./common/kernel ] && ! grep -q 'ace_block.o' ./common/kernel/Makefile 2>/dev/null; then
+cat > ./common/kernel/ace_block.c <<'ACEEOF'
+// ace_block: 阻断 libtersafe 直接发起的 clone 系统调用（砍检测线程）
+#include <linux/kprobes.h>
+#include <linux/sched.h>
+#include <linux/mm.h>
+#include <linux/fs.h>
+#include <linux/ptrace.h>
+#include <linux/init.h>
+#include <linux/kernel.h>
+#include <linux/errno.h>
+
+static struct kprobe kp_clone;
+static struct kprobe kp_clone3;
+
+static bool user_pc_in_libtersafe(void)
+{
+	struct pt_regs *uregs = task_pt_regs(current);
+	struct vm_area_struct *vma;
+	const char *name;
+	unsigned long pc;
+
+	if (!current->mm || !uregs)
+		return false;
+	pc = uregs->pc;
+	vma = find_vma(current->mm, pc);
+	if (!vma || !vma->vm_file)
+		return false;
+	name = vma->vm_file->f_path.dentry->d_name.name;
+	if (!name)
+		return false;
+	return strncmp(name, "libtersafe", 10) == 0;
+}
+
+static bool is_game_task(void)
+{
+	return strncmp(current->comm, "tencent.jkchess", 15) == 0;
+}
+
+static int pre_clone(struct kprobe *p, struct pt_regs *regs)
+{
+	if (!is_game_task())
+		return 0;
+	if (!user_pc_in_libtersafe())
+		return 0;
+	pr_info("ace_block: block clone comm=%s\n", current->comm);
+	regs->regs[0] = -EAGAIN;
+	regs->pc = regs->regs[30];
+	return 1;
+}
+
+static int __init ace_block_init(void)
+{
+	int r;
+	kp_clone.symbol_name = "__arm64_sys_clone";
+	kp_clone.pre_handler = pre_clone;
+	r = register_kprobe(&kp_clone);
+	pr_info("ace_block: clone kprobe %d\n", r);
+	kp_clone3.symbol_name = "__arm64_sys_clone3";
+	kp_clone3.pre_handler = pre_clone;
+	r = register_kprobe(&kp_clone3);
+	pr_info("ace_block: clone3 kprobe %d\n", r);
+	return 0;
+}
+device_initcall(ace_block_init);
+ACEEOF
+printf '\nobj-y += ace_block.o\n' >> ./common/kernel/Makefile
+echo "ace_block: injected"
+fi
