@@ -331,6 +331,7 @@ if [ -f "$GITHUB_WORKSPACE/scripts/apply_hide_memfd.py" ] && [ -n "$KERNEL_ROOT"
     python3 "$GITHUB_WORKSPACE/scripts/apply_hide_memfd.py" "$KERNEL_ROOT/common/fs/proc/task_mmu.c" || true
 fi
 # ===== ACE 线程阻断（自定义补丁）=====
+if [ "${ACE_BLOCK:-0}" = "1" ]; then
 ACE_DIR="${KERNEL_ROOT:-.}/common"
 echo "ace_block: dir=$ACE_DIR"
 if [ -d "$ACE_DIR/kernel" ] && ! grep -q 'ace_block.o' "$ACE_DIR/kernel/Makefile" 2>/dev/null; then
@@ -401,4 +402,5 @@ device_initcall(ace_block_init);
 ACEEOF
 printf '\nobj-y += ace_block.o\n' >> "$ACE_DIR/kernel/Makefile"
 echo "ace_block: injected into $ACE_DIR"
+fi
 fi
