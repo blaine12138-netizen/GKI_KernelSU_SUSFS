@@ -1,0 +1,203 @@
+name: GKI 6.6 · BakaSU 35252 · AnyKernel3
+
+# 独立工作流：不依赖 build.yml / main.yml，单文件跑通
+# 产物：android15-6.6.<ver>-lts-BakaSU-35252[-KPM]-AnyKernel3.zip
+#
+# 用法：Actions -> 本工作流 -> Run workflow
+#   kpm=enabled   注入 KernelPatch（KPM 可用；管理器会提示内置 kpm 管理停止工作）
+#   kpm=disabled  纯净 BakaSU + SUSFS
+
+on:
+  workflow_dispatch:
+    inputs:
+      kpm:
+        description: "注入 KPM (KernelPatch)"
+        required: true
+        type: choice
+        options: [enabled, disabled]
+        default: enabled
+      kernel_branch:
+        description: "kernel/common 分支"
+        required: true
+        type: string
+        default: android15-6.6-lts
+      bakasu_commit:
+        description: "BakaSU 提交（35252 = d5e9e025b8b49155f8014684d64c91742b465f65）"
+        required: true
+        type: string
+        default: d5e9e025b8b49155f8014684d64c91742b465f65
+      susfs_branch:
+        description: "susfs4ksu 分支"
+        required: true
+        type: string
+        default: gki-android15-6.6
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: "6.6-lts BakaSU KPM=${{ inputs.kpm }}"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: 安装依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang-18 lld-18 llvm-18 libssl-dev libelf-dev bc flex bison cpio kmod rsync dwarves device-tree-compiler zstd lz4 zip unzip ccache
+          clang-18 --version | head -1
+          ld.lld-18 --version | head -1
+
+      - name: 拉取 GKI 内核源码
+        run: |
+          set -euo pipefail
+          git clone --depth 1 -b "${{ inputs.kernel_branch }}" https://android.googlesource.com/kernel/common kernel
+          cd kernel
+          echo "KERNEL_COMMIT=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_ENV"
+          head -5 Makefile
+
+      - name: 集成 BakaSU
+        run: |
+          set -euo pipefail
+          cd kernel
+          git clone --filter=blob:none https://github.com/Baka-SU/BakaSU KernelSU
+          git -C KernelSU checkout "${{ inputs.bakasu_commit }}"
+          echo "BAKASU_SHA=$(git -C KernelSU rev-parse --short=12 HEAD)" >> "$GITHUB_ENV"
+
+          ln -sfn "$PWD/KernelSU/kernel" drivers/kernelsu
+          grep -q 'obj-$(CONFIG_KSU) += kernelsu/' drivers/Makefile || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+          if ! grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig; then
+            if tail -1 drivers/Kconfig | grep -q '^endmenu'; then
+              sed -i '$i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+            else
+              sed -i '/^endmenu$/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+            fi
+          fi
+          tail -3 drivers/Makefile
+
+      - name: 集成 SUSFS
+        run: |
+          set -euo pipefail
+          cd kernel
+          git clone --depth 1 -b "${{ inputs.susfs_branch }}" https://gitlab.com/simonpunk/susfs4ksu.git /tmp/susfs
+          echo "SUSFS_SHA=$(git -C /tmp/susfs rev-parse --short=12 HEAD)" >> "$GITHUB_ENV"
+
+          P="50_add_susfs_in_gki-android15-6.6.patch"
+          cp "/tmp/susfs/kernel_patches/$P" .
+          cp /tmp/susfs/kernel_patches/fs/* fs/
+          cp /tmp/susfs/kernel_patches/include/linux/* include/linux/
+
+          if grep -qF 'VMA_PAD_START(vma)' "$P" && ! grep -Rqs 'VMA_PAD_START' include/linux; then
+            sed -i 's/VMA_PAD_START(vma)/vma->vm_end/g' "$P"
+          fi
+          if grep -q '^ static int thaw_super_locked' "$P" && grep -qF '#include <trace/hooks/fs.h>' fs/super.c; then
+            sed -i '/^#include <trace\/hooks\/fs.h>$/,+1d' fs/super.c
+          fi
+
+          patch -p1 --forward < "$P" || true
+          echo "--- rej ---"
+          find . -name '*.rej' | head -20 || true
+          test -f fs/susfs.c
+
+      - name: 内核配置
+        run: |
+          set -euo pipefail
+          cd kernel
+          CFG=arch/arm64/configs/gki_defconfig
+          BID="ab$((RANDOM % 90000000 + 10000000))"
+          LOCAL="-android15-8-g$KERNEL_COMMIT-$BID"
+          sed -i "s|^CONFIG_LOCALVERSION=.*|CONFIG_LOCALVERSION=\"$LOCAL\"|" "$CFG"
+          grep -q '^CONFIG_LOCALVERSION=' "$CFG" || echo "CONFIG_LOCALVERSION=\"$LOCAL\"" >> "$CFG"
+
+          cat >> "$CFG" <<'EOF'
+          CONFIG_KSU=y
+          CONFIG_TMPFS_XATTR=y
+          CONFIG_TMPFS_POSIX_ACL=y
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_SUS_MAP=y
+          EOF
+
+          make -j"$(nproc)" ARCH=arm64 LLVM=-18 O=out gki_defconfig
+          scripts/config --file out/.config -d LOCALVERSION_AUTO
+          sed -i 's|^[[:space:]]*scm_version="$(scm_version --short)"$|\tscm_version=""|' scripts/setlocalversion
+          sed -i "s/printf '%s' -dirty/printf '%s' ''/" scripts/setlocalversion
+          make -j"$(nproc)" ARCH=arm64 LLVM=-18 O=out olddefconfig
+          grep -E '^CONFIG_KSU=|^CONFIG_KSU_SUSFS=|^CONFIG_LTO|^CONFIG_LOCALVERSION' out/.config
+
+      - name: 编译 Image
+        run: |
+          set -euo pipefail
+          cd kernel
+          export KBUILD_BUILD_TIMESTAMP="$(date -u '+%a %b %d %T UTC %Y')"
+          make -j"$(nproc)" ARCH=arm64 LLVM=-18 O=out Image 2>&1 | tee build.log
+          ls -l out/arch/arm64/boot/Image
+          strings out/arch/arm64/boot/Image | grep -m2 'Linux version' || true
+          cp out/arch/arm64/boot/Image "$GITHUB_WORKSPACE/Image"
+
+      - name: KPM 注入
+        if: inputs.kpm == 'enabled'
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/ShirkNeko/SukiSU_patch.git /tmp/susupatch
+          mkdir -p /tmp/kpm && cp Image /tmp/kpm/Image
+          cp /tmp/susupatch/kpm/patch_linux /tmp/kpm/patch_linux
+          chmod +x /tmp/kpm/patch_linux
+          cd /tmp/kpm
+          if ./patch_linux > patch.log 2>&1 && [ -s oImage ]; then
+            tail -15 patch.log
+            mv oImage Image
+            cp Image "$GITHUB_WORKSPACE/Image.kpm"
+            echo "KPM 注入完成"
+          else
+            tail -40 patch.log || true
+            echo "::warning::KPM 注入失败，本次只上传未打补丁的 Image"
+          fi
+
+      - name: 打包 AnyKernel3
+        run: |
+          set -euo pipefail
+          git clone --depth 1 -b gki-2.0 https://github.com/WildKernels/AnyKernel3.git ak3
+          rm -rf ak3/.git ak3/split_img ak3/ramdisk
+
+          KVER="$(awk -F'= *' '/^VERSION /{print $2}' kernel/Makefile).$(awk -F'= *' '/^PATCHLEVEL /{print $2}' kernel/Makefile).$(awk -F'= *' '/^SUBLEVEL /{print $2}' kernel/Makefile)"
+          echo "KVER=$KVER"
+          DESC="BakaSU $BAKASU_SHA | GKI $KVER android15-6.6-lts | SUSFS $SUSFS_SHA"
+
+          pack() {
+            image="$1"; name="$2"; desc="$3"
+            rm -rf ak3pkg && cp -r ak3 ak3pkg
+            sed -i "s#^kernel.string=.*#kernel.string=$desc#" ak3pkg/anykernel.sh
+            cp "$image" ak3pkg/Image
+            ( cd ak3pkg && zip -r9 "../$name.zip" . -x '.git/*' > /dev/null )
+            ls -l "$name.zip"
+          }
+
+          if [ -f Image.kpm ]; then
+            cp Image Image.plain
+            cp Image.kpm Image
+            pack Image "android15-$KVER-lts-BakaSU-35252-KPM-AnyKernel3" "$DESC | KPM"
+            cp Image.plain Image
+          fi
+          pack Image "android15-$KVER-lts-BakaSU-35252-AnyKernel3" "$DESC"
+          sha256sum Image Image.kpm *.zip > SHA256SUMS.txt 2>/dev/null || sha256sum Image *.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: GKI-6.6-lts-BakaSU-35252-${{ inputs.kpm }}
+          path: |
+            *.zip
+            Image
+            Image.kpm
+            SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
